@@ -282,8 +282,7 @@ namespace TDSProxy
 
 						if (VerboseLogging)
 							log.DebugFormat("Peeking for a TDS-wrapped SSL packet from {0}", _peerEP);
-						var byteCount = await _connection
-						                      ._outsideStream.ReadAsync(peekBuf, 0, 1, cancellationToken)
+						var byteCount = await _inner.ReadAsync(peekBuf, 0, 1, cancellationToken)
 						                      .ConfigureAwait(false);
 						if (VerboseLogging)
 							log.DebugFormat("Peek got {0} bytes from {1}", byteCount, _peerEP);
@@ -351,8 +350,7 @@ namespace TDSProxy
 								return 1;
 							}
 
-							byteCount = await _connection
-							                  ._outsideStream
+							byteCount = await _inner
 							                  .ReadAsync(buffer, offset + 1, count - 1, cancellationToken)
 							                  .ConfigureAwait(false);
 							if (VerboseLogging)
