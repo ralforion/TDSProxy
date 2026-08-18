@@ -70,6 +70,11 @@ namespace TDSProxy
 		readonly Task _processingTask;
 
 		TDSPreLoginMessage.EncryptionEnum _encryptionSettingForClient;
+
+		// What the SERVER answered in its PreLogin response. Kept separately because that response
+		// object is rewritten with _encryptionSettingForClient before being forwarded to the client,
+		// and the server-side TLS decision must not be made from the client-side value.
+		TDSPreLoginMessage.EncryptionEnum? _encryptionSettingFromServer;
 		ushort _spid;
 		ushort _packetLength = 4096;
 		uint _clientTdsVersion;
@@ -894,6 +899,7 @@ namespace TDSProxy
 						                _outsideEP);
 						return null;
 					}
+					_encryptionSettingFromServer = preLoginResponse.Encryption;
 					log.DebugFormat("Server {0} responded with Encryption={1}, will establish TLS",
 					                _insideEP,
 					                preLoginResponse.Encryption);
@@ -951,12 +957,17 @@ namespace TDSProxy
 			if (_serverTlsConfig?.Enabled != true)
 				return true;
 
-			if (preLoginResponse.Encryption != TDSPreLoginMessage.EncryptionEnum.On &&
-			    preLoginResponse.Encryption != TDSPreLoginMessage.EncryptionEnum.Required)
+			// _encryptionSettingFromServer, NOT preLoginResponse.Encryption: by the time we get
+			// here the response has been rewritten with the value being sent to the CLIENT, so
+			// reading it back would make a plaintext client leg silently disable server TLS — the
+			// server then drops the connection right after LOGIN7, having demanded encryption.
+			var serverEncryption = _encryptionSettingFromServer ?? preLoginResponse.Encryption;
+			if (serverEncryption != TDSPreLoginMessage.EncryptionEnum.On &&
+			    serverEncryption != TDSPreLoginMessage.EncryptionEnum.Required)
 			{
 				log.DebugFormat("Server {0} does not require TLS (Encryption={1}), skipping server TLS",
 				                _insideEP,
-				                preLoginResponse.Encryption);
+				                serverEncryption);
 				return true;
 			}
 
