@@ -297,13 +297,22 @@ namespace TDSProxy
 						{
 							if (VerboseLogging)
 								log.DebugFormat("Reading TDS-wrapped SSL packet from {0}", _peerEP);
-							var packets = await TDSPacket
-							                    .ReadAsync(TDSMessageType.PreLogin,
-							                               _inner,
-							                               cancellationToken)
-							                    .ConfigureAwait(false);
-							var wrapper = (TDSPreLoginMessage)TDSMessage.FromPackets(packets);
-							var payload = wrapper.SslPayload;
+							// EXACTLY ONE packet, not TDSPacket.ReadAsync: that loops until a packet
+							// carries EndOfMessage, and SQL Server leaves EOM clear on its handshake
+							// packets (observed 12 01 03 5a 00 00 00 00 carrying the whole
+							// ServerHello/Certificate/ServerHelloDone flight). Waiting for an EOM
+							// that never arrives hangs the handshake until the connection is reset
+							// minutes later. It is also the more correct reading: TLS records are a
+							// byte stream that does not respect TDS message boundaries, so each
+							// packet's payload is simply the next chunk, and SslStream asks again
+							// when it needs more.
+							var packet = await TDSPacket
+							                   .ReadSinglePacketAsync(TDSMessageType.PreLogin,
+							                                          _inner,
+							                                          readPacketTypeFromStream: false,
+							                                          cancellationToken)
+							                   .ConfigureAwait(false);
+							var payload = packet.Payload;
 							if (VerboseLogging)
 								log.DebugFormat("Got {0} bytes of SSL payload from {1}",
 								                payload.Length,
