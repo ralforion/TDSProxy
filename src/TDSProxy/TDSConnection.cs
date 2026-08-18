@@ -42,6 +42,21 @@ namespace TDSProxy
 		readonly TdsSslHandshakeAdapter _outsideAdapter;
 		TdsSslHandshakeAdapter _insideAdapter;
 		bool _insideSslHandshakeInProgress;
+
+		// Whether TLS was actually established with the client. False when the listener has no
+		// certificate, in which case the client leg stays plain TDS from PreLogin onwards.
+		bool _clientTlsActive;
+
+		/// Stream to read the Login7 message from: encrypted whenever a client handshake happened,
+		/// including EncryptionEnum.Off, which means "login packet only".
+		Stream ClientLoginStream => _clientTlsActive ? (Stream)_outsideSSL : _outsideStream;
+
+		/// Stream for traffic after login: plain when no handshake happened at all, and also when
+		/// the negotiated setting was Off, which encrypts the login packet and nothing more.
+		Stream ClientPostLoginStream =>
+			!_clientTlsActive || _encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
+				? (Stream)_outsideStream
+				: _outsideSSL;
 		readonly SslStream _outsideSSL;
 		readonly IPEndPoint _outsideEP;
 		readonly TcpClient _insideClient;
@@ -582,31 +597,46 @@ namespace TDSProxy
 					return;
 				}
 
-				log.DebugFormat("Starting SSL handshake with {0}", _outsideEP);
-				_state = StateEnum.SslHandshake;
+				// Only if we have a certificate to present. Without one there is nothing to
+				// authenticate as, and the client was told ENCRYPT_NOT_SUP in the PreLogin response,
+				// so it is not expecting a handshake either. Calling AuthenticateAsServerAsync(null)
+				// here is what used to happen, and it does not merely throw: on OpenSSL 1.1.1 with
+				// the SECLEVEL=0 config this image needs for the legacy server, it took the whole
+				// process down with a general protection fault in libc.
+				if (_listener.Certificate != null)
+				{
+					log.DebugFormat("Starting SSL handshake with {0}", _outsideEP);
+					_state = StateEnum.SslHandshake;
 
-				try
-				{
-					await _outsideSSL.AuthenticateAsServerAsync(_listener.Certificate).ConfigureAwait(false);
+					try
+					{
+						await _outsideSSL.AuthenticateAsServerAsync(_listener.Certificate).ConfigureAwait(false);
+						_clientTlsActive = true;
+					}
+					catch (Exception e)
+					{
+						log.Error("Failed to complete SSL handshake with " + _outsideEP, e);
+						return;
+					}
 				}
-				catch (Exception e)
+				else
 				{
-					log.Error("Failed to complete SSL handshake with " + _outsideEP, e);
-					return;
+					log.InfoFormat("Listener has no certificate; continuing unencrypted with {0}", _outsideEP);
 				}
 
 				if (!TDSProxyService.SkipLoginProcessing)
 				{
 					_state = StateEnum.Login;
 
-					log.DebugFormat(
-						"Established {0} session using {1}({2})-{3}({4}) with {5}",
-						_outsideSSL.SslProtocol,
-						_outsideSSL.HashAlgorithm,
-						_outsideSSL.HashStrength,
-						_outsideSSL.CipherAlgorithm,
-						_outsideSSL.CipherStrength,
-						_outsideEP);
+					if (_clientTlsActive)
+						log.DebugFormat(
+							"Established {0} session using {1}({2})-{3}({4}) with {5}",
+							_outsideSSL.SslProtocol,
+							_outsideSSL.HashAlgorithm,
+							_outsideSSL.HashStrength,
+							_outsideSSL.CipherAlgorithm,
+							_outsideSSL.CipherStrength,
+							_outsideEP);
 
 					var login7 = await ReadLogin7FromClient().ConfigureAwait(false);
 					if (null == login7)
@@ -789,8 +819,17 @@ namespace TDSProxy
 
 		private async Task ProcessAndForwardPreLogin(TDSPreLoginMessage preLoginMessage)
 		{
-			// We always want to talk SSL to the client (outside)
-			if (TDSProxyService.AllowUnencryptedConnections ||
+			// Without a listener certificate the client leg cannot be encrypted at all, so say so
+			// rather than demanding encryption we cannot provide. ENCRYPT_NOT_SUP (0x02), not
+			// ENCRYPT_OFF (0x00): "off" still means the login packet gets encrypted.
+			if (_listener.Certificate == null)
+			{
+				_encryptionSettingForClient = TDSPreLoginMessage.EncryptionEnum.NotSupported;
+				log.DebugFormat("No listener certificate; telling client {0} that encryption is not supported",
+				                _outsideEP);
+			}
+			// We otherwise always want to talk SSL to the client (outside)
+			else if (TDSProxyService.AllowUnencryptedConnections ||
 			    preLoginMessage.Encryption == TDSPreLoginMessage.EncryptionEnum.On)
 				_encryptionSettingForClient = preLoginMessage.Encryption ?? TDSPreLoginMessage.EncryptionEnum.On;
 			else
@@ -1053,7 +1092,7 @@ namespace TDSProxy
 			try
 			{
 				var cts = new CancellationTokenSource(30_000);
-				var packetsFromClient = await TDSPacket.ReadAsync(_outsideSSL, cts.Token);
+				var packetsFromClient = await TDSPacket.ReadAsync(ClientLoginStream, cts.Token);
 				var packetList = packetsFromClient as List<TDSPacket> ?? packetsFromClient.ToList();
 				_spid = packetList[0].SPID;
 				var message = TDSMessage.FromPackets(packetList);
@@ -1164,9 +1203,7 @@ namespace TDSProxy
 			              });
 			msg.BuildMessage();
 
-			await msg.WriteAsPacketsAsync(_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-				                              ? (Stream)_outsideStream
-				                              : _outsideSSL,
+			await msg.WriteAsPacketsAsync(ClientPostLoginStream,
 			                              _packetLength,
 			                              _spid)
 			         .ConfigureAwait(false);
@@ -1235,9 +1272,7 @@ namespace TDSProxy
 
 					// Login was accepted, forward response to client
 					await loginResponse
-					      .WriteAsPacketsAsync(_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-						                           ? (Stream)_outsideStream
-						                           : _outsideSSL,
+					      .WriteAsPacketsAsync(ClientPostLoginStream,
 					                           _packetLength,
 					                           _spid)
 					      .ConfigureAwait(false);
@@ -1281,12 +1316,8 @@ namespace TDSProxy
 		{
 			try
 			{
-				var outsideStream = (_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-					                     ? (Stream)_outsideStream
-					                     : _outsideSSL);
-				var outsideStreamName = _encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-					                        ? "_outsideStream"
-					                        : "_outsideSSL";
+				var outsideStream = ClientPostLoginStream;
+				var outsideStreamName = ReferenceEquals(outsideStream, _outsideSSL) ? "_outsideSSL" : "_outsideStream";
 				var packetTypeBuffer = new byte[1];
 				while (true)
 				{
@@ -1353,10 +1384,8 @@ namespace TDSProxy
 		{
 			try
 			{
-				var outsideStream = (_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-					                     ? (Stream)_outsideStream
-					                     : _outsideSSL);
-				bool flushAfterWrite = _encryptionSettingForClient != TDSPreLoginMessage.EncryptionEnum.Off;
+				var outsideStream = ClientPostLoginStream;
+				bool flushAfterWrite = ReferenceEquals(outsideStream, _outsideSSL);
 				var packetTypeBuffer = new byte[1];
 				Task flushTask = null;
 				while (true)
