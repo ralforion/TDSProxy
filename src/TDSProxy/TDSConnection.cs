@@ -40,6 +40,23 @@ namespace TDSProxy
 		readonly TcpClient _outsideClient;
 		readonly NetworkStream _outsideStream;
 		readonly TdsSslHandshakeAdapter _outsideAdapter;
+		TdsSslHandshakeAdapter _insideAdapter;
+		bool _insideSslHandshakeInProgress;
+
+		// Whether TLS was actually established with the client. False when the listener has no
+		// certificate, in which case the client leg stays plain TDS from PreLogin onwards.
+		bool _clientTlsActive;
+
+		/// Stream to read the Login7 message from: encrypted whenever a client handshake happened,
+		/// including EncryptionEnum.Off, which means "login packet only".
+		Stream ClientLoginStream => _clientTlsActive ? (Stream)_outsideSSL : _outsideStream;
+
+		/// Stream for traffic after login: plain when no handshake happened at all, and also when
+		/// the negotiated setting was Off, which encrypts the login packet and nothing more.
+		Stream ClientPostLoginStream =>
+			!_clientTlsActive || _encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
+				? (Stream)_outsideStream
+				: _outsideSSL;
 		readonly SslStream _outsideSSL;
 		readonly IPEndPoint _outsideEP;
 		readonly TcpClient _insideClient;
@@ -53,6 +70,11 @@ namespace TDSProxy
 		readonly Task _processingTask;
 
 		TDSPreLoginMessage.EncryptionEnum _encryptionSettingForClient;
+
+		// What the SERVER answered in its PreLogin response. Kept separately because that response
+		// object is rewritten with _encryptionSettingForClient before being forwarded to the client,
+		// and the server-side TLS decision must not be made from the client-side value.
+		TDSPreLoginMessage.EncryptionEnum? _encryptionSettingFromServer;
 		ushort _spid;
 		ushort _packetLength = 4096;
 		uint _clientTdsVersion;
@@ -96,14 +118,41 @@ namespace TDSProxy
 			}
 
 			readonly TDSConnection _connection;
+			readonly Stream _inner;
+			readonly TDSMessageType _writeMessageType;
+			readonly bool _isInside;
 
 			byte[] _wrapperBytes;
 			int _wrapperOffset;
 
-			public TdsSslHandshakeAdapter(TDSConnection connection)
+			/// <param name="inner">The raw network stream this adapter wraps.</param>
+			/// <param name="writeMessageType">
+			/// TDS message type to wrap outgoing handshake records in. Handshake records travelling
+			/// client-to-server are PreLogin (0x12); a server's replies are TabularResult (0x04).
+			/// This adapter is the client of the inside connection and the server of the outside
+			/// one, so the two legs write different types.
+			/// </param>
+			/// <param name="isInside">True for the leg towards SQL Server, false for the leg towards the client.</param>
+			public TdsSslHandshakeAdapter(TDSConnection connection,
+			                              Stream inner,
+			                              TDSMessageType writeMessageType,
+			                              bool isInside)
 			{
 				_connection = connection;
+				_inner = inner;
+				_writeMessageType = writeMessageType;
+				_isInside = isInside;
 			}
+
+			// MS-TDS tunnels the TLS handshake inside TDS packets on BOTH legs, but the two
+			// handshakes happen at different points in the connection's life: the server handshake
+			// runs during PreLogin processing, before the connection enters SslHandshake state for
+			// the client handshake. So the inside leg cannot key off _state and carries its own flag.
+			bool WrappingActive => _isInside
+				                       ? _connection._insideSslHandshakeInProgress
+				                       : _connection._state == StateEnum.SslHandshake;
+
+			IPEndPoint _peerEP => _isInside ? _connection._insideEP : _peerEP;
 
 			public override IAsyncResult BeginRead(byte[] buffer,
 			                                       int offset,
@@ -137,20 +186,20 @@ namespace TDSProxy
 				return result;
 			}
 
-			public override bool CanRead => _connection._outsideStream.CanRead;
+			public override bool CanRead => _inner.CanRead;
 
 			public override bool CanSeek => false;
 
-			public override bool CanTimeout => _connection._outsideStream.CanTimeout;
+			public override bool CanTimeout => _inner.CanTimeout;
 
-			public override bool CanWrite => _connection._outsideStream.CanWrite;
+			public override bool CanWrite => _inner.CanWrite;
 
 			protected override void Dispose(bool disposing)
 			{
 				try
 				{
 					if (disposing)
-						_connection._outsideStream.Close();
+						_inner.Close();
 				}
 				finally
 				{
@@ -184,12 +233,12 @@ namespace TDSProxy
 
 			public override void Flush()
 			{
-				_connection._outsideStream.Flush();
+				_inner.Flush();
 			}
 
 			public override Task FlushAsync(CancellationToken cancellationToken)
 			{
-				return _connection._outsideStream.FlushAsync(cancellationToken);
+				return _inner.FlushAsync(cancellationToken);
 			}
 
 			public override long Length => throw new NotSupportedException("Seek is not supported");
@@ -214,7 +263,7 @@ namespace TDSProxy
 			{
 				if (VerboseLogging)
 					log.Debug("Wrapper ReadAsync called");
-				if (_connection._state == StateEnum.SslHandshake)
+				if (WrappingActive)
 				{
 					// Did we have payload from a previous wrapper left over?
 					if (null != _wrapperBytes)
@@ -243,7 +292,7 @@ namespace TDSProxy
 							log.DebugFormat("Returning {0} bytes from buffer (caller requested {1}), outsideEP = {2}",
 							                returnCount,
 							                count,
-							                _connection._outsideEP);
+							                _peerEP);
 						return returnCount;
 					}
 					else
@@ -252,12 +301,11 @@ namespace TDSProxy
 						byte[] peekBuf = new byte[1];
 
 						if (VerboseLogging)
-							log.DebugFormat("Peeking for a TDS-wrapped SSL packet from {0}", _connection._outsideEP);
-						var byteCount = await _connection
-						                      ._outsideStream.ReadAsync(peekBuf, 0, 1, cancellationToken)
+							log.DebugFormat("Peeking for a TDS-wrapped SSL packet from {0}", _peerEP);
+						var byteCount = await _inner.ReadAsync(peekBuf, 0, 1, cancellationToken)
 						                      .ConfigureAwait(false);
 						if (VerboseLogging)
-							log.DebugFormat("Peek got {0} bytes from {1}", byteCount, _connection._outsideEP);
+							log.DebugFormat("Peek got {0} bytes from {1}", byteCount, _peerEP);
 						if (byteCount == 0)
 						{
 							return 0;
@@ -267,18 +315,27 @@ namespace TDSProxy
 						    TDSMessageType.TabularResult == (TDSMessageType)peekBuf[0])
 						{
 							if (VerboseLogging)
-								log.DebugFormat("Reading TDS-wrapped SSL packet from {0}", _connection._outsideEP);
-							var packets = await TDSPacket
-							                    .ReadAsync(TDSMessageType.PreLogin,
-							                               _connection._outsideStream,
-							                               cancellationToken)
-							                    .ConfigureAwait(false);
-							var wrapper = (TDSPreLoginMessage)TDSMessage.FromPackets(packets);
-							var payload = wrapper.SslPayload;
+								log.DebugFormat("Reading TDS-wrapped SSL packet from {0}", _peerEP);
+							// EXACTLY ONE packet, not TDSPacket.ReadAsync: that loops until a packet
+							// carries EndOfMessage, and SQL Server leaves EOM clear on its handshake
+							// packets (observed 12 01 03 5a 00 00 00 00 carrying the whole
+							// ServerHello/Certificate/ServerHelloDone flight). Waiting for an EOM
+							// that never arrives hangs the handshake until the connection is reset
+							// minutes later. It is also the more correct reading: TLS records are a
+							// byte stream that does not respect TDS message boundaries, so each
+							// packet's payload is simply the next chunk, and SslStream asks again
+							// when it needs more.
+							var packet = await TDSPacket
+							                   .ReadSinglePacketAsync(TDSMessageType.PreLogin,
+							                                          _inner,
+							                                          readPacketTypeFromStream: false,
+							                                          cancellationToken)
+							                   .ConfigureAwait(false);
+							var payload = packet.Payload;
 							if (VerboseLogging)
 								log.DebugFormat("Got {0} bytes of SSL payload from {1}",
 								                payload.Length,
-								                _connection._outsideEP);
+								                _peerEP);
 							int unwrappedCount;
 							if (payload.Length > count)
 							{
@@ -298,7 +355,7 @@ namespace TDSProxy
 									unwrappedCount,
 									payload.Length,
 									count,
-									_connection._outsideEP);
+									_peerEP);
 							return unwrappedCount;
 						}
 						else
@@ -309,12 +366,11 @@ namespace TDSProxy
 								if (VerboseLogging)
 									log.DebugFormat(
 										"Returning 1 byte after peek showed non-TDS packet (caller requested 1), outsideEP = {0}",
-										_connection._outsideEP);
+										_peerEP);
 								return 1;
 							}
 
-							byteCount = await _connection
-							                  ._outsideStream
+							byteCount = await _inner
 							                  .ReadAsync(buffer, offset + 1, count - 1, cancellationToken)
 							                  .ConfigureAwait(false);
 							if (VerboseLogging)
@@ -322,7 +378,7 @@ namespace TDSProxy
 									"Returning {0} bytes from network after peek showed non-TDS packet (caller requested {1}), outsideEP = {2}",
 									byteCount + 1,
 									count,
-									_connection._outsideEP);
+									_peerEP);
 							return byteCount + 1;
 						}
 					}
@@ -334,26 +390,26 @@ namespace TDSProxy
 					log.WarnFormat("Discarding {0} of {1} bytes from unconsumed wrapper from {2}",
 					               _wrapperBytes.Length,
 					               _wrapperBytes.Length - _wrapperOffset,
-					               _connection._outsideEP);
+					               _peerEP);
 					_wrapperBytes = null;
 					_wrapperOffset = 0;
 				}
 
 				var underlyingBytes =
-					await _connection._outsideStream.ReadAsync(buffer, offset, count, cancellationToken)
+					await _inner.ReadAsync(buffer, offset, count, cancellationToken)
 					                 .ConfigureAwait(false);
 				if (VerboseLogging)
 					log.DebugFormat("Returning {0} bytes (requested {1}) from {2} in non-wrapped mode",
 					                underlyingBytes,
 					                count,
-					                _connection._outsideEP);
+					                _peerEP);
 				return underlyingBytes;
 			}
 
 			public override int ReadTimeout
 			{
-				get => _connection._outsideStream.ReadTimeout;
-				set => _connection._outsideStream.ReadTimeout = value;
+				get => _inner.ReadTimeout;
+				set => _inner.ReadTimeout = value;
 			}
 
 			public override long Seek(long offset, SeekOrigin origin)
@@ -380,28 +436,28 @@ namespace TDSProxy
 			{
 				if (VerboseLogging)
 					log.Debug("Wrapper WriteAsync called");
-				if (_connection._state == StateEnum.SslHandshake)
+				if (WrappingActive)
 				{
 					byte[] sslBuffer = new byte[count];
 					Buffer.BlockCopy(buffer, offset, sslBuffer, 0, count);
 					var msg = new TDSPreLoginMessage {SslPayload = sslBuffer};
 					await msg
 					      .WriteAsPacketsAsync(
-						      _connection._outsideStream,
+						      _inner,
 						      _connection._packetLength,
 						      _connection._spid,
-						      overrideMessageType: TDSMessageType.TabularResult,
+						      overrideMessageType: _writeMessageType,
 						      cancellationToken: cancellationToken)
 					      .ConfigureAwait(false);
 				}
 				else
-					await _connection._outsideStream.WriteAsync(buffer, offset, count, cancellationToken);
+					await _inner.WriteAsync(buffer, offset, count, cancellationToken);
 			}
 
 			public override int WriteTimeout
 			{
-				get => _connection._outsideStream.WriteTimeout;
-				set => _connection._outsideStream.WriteTimeout = value;
+				get => _inner.WriteTimeout;
+				set => _inner.WriteTimeout = value;
 			}
 		}
 
@@ -430,7 +486,7 @@ namespace TDSProxy
 			_outsideEP = (IPEndPoint)outsideClient.Client.RemoteEndPoint;
 			_outsideClient = outsideClient;
 			_outsideStream = outsideClient.GetStream();
-			_outsideAdapter = new TdsSslHandshakeAdapter(this);
+			_outsideAdapter = new TdsSslHandshakeAdapter(this, _outsideStream, TDSMessageType.TabularResult, isInside: false);
 			_outsideSSL = new SslStream(_outsideAdapter);
 
 			_insideEP = insideEndPoint;
@@ -546,31 +602,46 @@ namespace TDSProxy
 					return;
 				}
 
-				log.DebugFormat("Starting SSL handshake with {0}", _outsideEP);
-				_state = StateEnum.SslHandshake;
+				// Only if we have a certificate to present. Without one there is nothing to
+				// authenticate as, and the client was told ENCRYPT_NOT_SUP in the PreLogin response,
+				// so it is not expecting a handshake either. Calling AuthenticateAsServerAsync(null)
+				// here is what used to happen, and it does not merely throw: on OpenSSL 1.1.1 with
+				// the SECLEVEL=0 config this image needs for the legacy server, it took the whole
+				// process down with a general protection fault in libc.
+				if (_listener.Certificate != null)
+				{
+					log.DebugFormat("Starting SSL handshake with {0}", _outsideEP);
+					_state = StateEnum.SslHandshake;
 
-				try
-				{
-					await _outsideSSL.AuthenticateAsServerAsync(_listener.Certificate).ConfigureAwait(false);
+					try
+					{
+						await _outsideSSL.AuthenticateAsServerAsync(_listener.Certificate).ConfigureAwait(false);
+						_clientTlsActive = true;
+					}
+					catch (Exception e)
+					{
+						log.Error("Failed to complete SSL handshake with " + _outsideEP, e);
+						return;
+					}
 				}
-				catch (Exception e)
+				else
 				{
-					log.Error("Failed to complete SSL handshake with " + _outsideEP, e);
-					return;
+					log.InfoFormat("Listener has no certificate; continuing unencrypted with {0}", _outsideEP);
 				}
 
 				if (!TDSProxyService.SkipLoginProcessing)
 				{
 					_state = StateEnum.Login;
 
-					log.DebugFormat(
-						"Established {0} session using {1}({2})-{3}({4}) with {5}",
-						_outsideSSL.SslProtocol,
-						_outsideSSL.HashAlgorithm,
-						_outsideSSL.HashStrength,
-						_outsideSSL.CipherAlgorithm,
-						_outsideSSL.CipherStrength,
-						_outsideEP);
+					if (_clientTlsActive)
+						log.DebugFormat(
+							"Established {0} session using {1}({2})-{3}({4}) with {5}",
+							_outsideSSL.SslProtocol,
+							_outsideSSL.HashAlgorithm,
+							_outsideSSL.HashStrength,
+							_outsideSSL.CipherAlgorithm,
+							_outsideSSL.CipherStrength,
+							_outsideEP);
 
 					var login7 = await ReadLogin7FromClient().ConfigureAwait(false);
 					if (null == login7)
@@ -753,8 +824,17 @@ namespace TDSProxy
 
 		private async Task ProcessAndForwardPreLogin(TDSPreLoginMessage preLoginMessage)
 		{
-			// We always want to talk SSL to the client (outside)
-			if (TDSProxyService.AllowUnencryptedConnections ||
+			// Without a listener certificate the client leg cannot be encrypted at all, so say so
+			// rather than demanding encryption we cannot provide. ENCRYPT_NOT_SUP (0x02), not
+			// ENCRYPT_OFF (0x00): "off" still means the login packet gets encrypted.
+			if (_listener.Certificate == null)
+			{
+				_encryptionSettingForClient = TDSPreLoginMessage.EncryptionEnum.NotSupported;
+				log.DebugFormat("No listener certificate; telling client {0} that encryption is not supported",
+				                _outsideEP);
+			}
+			// We otherwise always want to talk SSL to the client (outside)
+			else if (TDSProxyService.AllowUnencryptedConnections ||
 			    preLoginMessage.Encryption == TDSPreLoginMessage.EncryptionEnum.On)
 				_encryptionSettingForClient = preLoginMessage.Encryption ?? TDSPreLoginMessage.EncryptionEnum.On;
 			else
@@ -819,6 +899,7 @@ namespace TDSProxy
 						                _outsideEP);
 						return null;
 					}
+					_encryptionSettingFromServer = preLoginResponse.Encryption;
 					log.DebugFormat("Server {0} responded with Encryption={1}, will establish TLS",
 					                _insideEP,
 					                preLoginResponse.Encryption);
@@ -876,12 +957,17 @@ namespace TDSProxy
 			if (_serverTlsConfig?.Enabled != true)
 				return true;
 
-			if (preLoginResponse.Encryption != TDSPreLoginMessage.EncryptionEnum.On &&
-			    preLoginResponse.Encryption != TDSPreLoginMessage.EncryptionEnum.Required)
+			// _encryptionSettingFromServer, NOT preLoginResponse.Encryption: by the time we get
+			// here the response has been rewritten with the value being sent to the CLIENT, so
+			// reading it back would make a plaintext client leg silently disable server TLS — the
+			// server then drops the connection right after LOGIN7, having demanded encryption.
+			var serverEncryption = _encryptionSettingFromServer ?? preLoginResponse.Encryption;
+			if (serverEncryption != TDSPreLoginMessage.EncryptionEnum.On &&
+			    serverEncryption != TDSPreLoginMessage.EncryptionEnum.Required)
 			{
 				log.DebugFormat("Server {0} does not require TLS (Encryption={1}), skipping server TLS",
 				                _insideEP,
-				                preLoginResponse.Encryption);
+				                serverEncryption);
 				return true;
 			}
 
@@ -889,21 +975,41 @@ namespace TDSProxy
 
 			try
 			{
-				// Create SSL stream with certificate validation callback based on config
+				// The handshake with SQL Server must be tunnelled in TDS packets exactly as the
+				// handshake with the client is (MS-TDS 2.2.6.5): each TLS record travels as the
+				// payload of a PreLogin packet until the handshake completes. Handing SslStream the
+				// raw socket instead puts a bare ClientHello on the wire, which SQL Server does not
+				// recognise as a TDS packet — it answers nothing at all, and the connection dies on
+				// a timeout minutes later with "Connection reset by peer" rather than a TLS alert.
+				_insideAdapter = new TdsSslHandshakeAdapter(this,
+				                                            _insideStream,
+				                                            TDSMessageType.PreLogin,
+				                                            isInside: true);
+
 				_insideSSL = new SslStream(
-					_insideStream,
+					_insideAdapter,
 					leaveInnerStreamOpen: true,
 					userCertificateValidationCallback: ValidateServerCertificate);
 
 				// Parse TLS protocols from config
 				var sslProtocols = ParseSslProtocols(_serverTlsConfig.Protocols);
 
-				// Authenticate as client to the SQL Server
-				await _insideSSL.AuthenticateAsClientAsync(
-					_insideEP.Address.ToString(),
-					clientCertificates: null,
-					enabledSslProtocols: sslProtocols,
-					checkCertificateRevocation: false).ConfigureAwait(false);
+				// Wrapping is active only for the duration of the handshake; afterwards TDS packets
+				// travel inside the TLS records themselves and must not be wrapped again.
+				_insideSslHandshakeInProgress = true;
+				try
+				{
+					// Authenticate as client to the SQL Server
+					await _insideSSL.AuthenticateAsClientAsync(
+						_insideEP.Address.ToString(),
+						clientCertificates: null,
+						enabledSslProtocols: sslProtocols,
+						checkCertificateRevocation: false).ConfigureAwait(false);
+				}
+				finally
+				{
+					_insideSslHandshakeInProgress = false;
+				}
 
 				_insideActiveStream = _insideSSL;
 
@@ -997,7 +1103,7 @@ namespace TDSProxy
 			try
 			{
 				var cts = new CancellationTokenSource(30_000);
-				var packetsFromClient = await TDSPacket.ReadAsync(_outsideSSL, cts.Token);
+				var packetsFromClient = await TDSPacket.ReadAsync(ClientLoginStream, cts.Token);
 				var packetList = packetsFromClient as List<TDSPacket> ?? packetsFromClient.ToList();
 				_spid = packetList[0].SPID;
 				var message = TDSMessage.FromPackets(packetList);
@@ -1108,9 +1214,7 @@ namespace TDSProxy
 			              });
 			msg.BuildMessage();
 
-			await msg.WriteAsPacketsAsync(_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-				                              ? (Stream)_outsideStream
-				                              : _outsideSSL,
+			await msg.WriteAsPacketsAsync(ClientPostLoginStream,
 			                              _packetLength,
 			                              _spid)
 			         .ConfigureAwait(false);
@@ -1179,9 +1283,7 @@ namespace TDSProxy
 
 					// Login was accepted, forward response to client
 					await loginResponse
-					      .WriteAsPacketsAsync(_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-						                           ? (Stream)_outsideStream
-						                           : _outsideSSL,
+					      .WriteAsPacketsAsync(ClientPostLoginStream,
 					                           _packetLength,
 					                           _spid)
 					      .ConfigureAwait(false);
@@ -1225,12 +1327,8 @@ namespace TDSProxy
 		{
 			try
 			{
-				var outsideStream = (_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-					                     ? (Stream)_outsideStream
-					                     : _outsideSSL);
-				var outsideStreamName = _encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-					                        ? "_outsideStream"
-					                        : "_outsideSSL";
+				var outsideStream = ClientPostLoginStream;
+				var outsideStreamName = ReferenceEquals(outsideStream, _outsideSSL) ? "_outsideSSL" : "_outsideStream";
 				var packetTypeBuffer = new byte[1];
 				while (true)
 				{
@@ -1297,10 +1395,8 @@ namespace TDSProxy
 		{
 			try
 			{
-				var outsideStream = (_encryptionSettingForClient == TDSPreLoginMessage.EncryptionEnum.Off
-					                     ? (Stream)_outsideStream
-					                     : _outsideSSL);
-				bool flushAfterWrite = _encryptionSettingForClient != TDSPreLoginMessage.EncryptionEnum.Off;
+				var outsideStream = ClientPostLoginStream;
+				bool flushAfterWrite = ReferenceEquals(outsideStream, _outsideSSL);
 				var packetTypeBuffer = new byte[1];
 				Task flushTask = null;
 				while (true)
