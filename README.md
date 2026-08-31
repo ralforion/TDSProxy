@@ -6,6 +6,11 @@ TDSProxy is a proxy server for the MS SQL Server TDS (Tabular Data Stream) Proto
 > original work of Tech Software, and is distributed under its MIT licence — see
 > [LICENSE](LICENSE), which retains the original copyright.
 >
+> Upstream has been unmaintained since December 2021 — its last commit is from
+> then, and the pull requests open against it date back to 2020, including one
+> proposing this same .NET Core migration and one bumping log4net for the
+> advisory this fork has already patched. Nothing is being tracked from it.
+>
 > This fork makes it cross-platform and container-friendly: retargeted to .NET 6,
 > a Docker image with an OpenSSL configuration that still permits TLS 1.0 to
 > legacy backends, JSON/`appsettings.json` configuration in place of the .NET
