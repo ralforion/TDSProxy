@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Runs before everything else, and every other job needs it. Running it
+  # alongside them would be too late: a parallel job has already executed its own
+  # `uses:` before this could fail, so for a forged pin the attacker's code runs
+  # anyway and the check only blocks the merge, not the run.
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify every Action is pinned to its named release
+        run: ./scripts/check-action-pins.sh
+
+  build:
+    needs: pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "6.0.x"
+
+      - name: Restore
+        run: dotnet restore src/TDSProxy.sln
+
+      - name: Build
+        run: dotnet build src/TDSProxy.sln -c Release --no-restore
+
+      - name: Test
+        run: dotnet test src/TDSProxy.sln -c Release --no-build --verbosity normal

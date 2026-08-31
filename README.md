@@ -2,6 +2,17 @@
 
 TDSProxy is a proxy server for the MS SQL Server TDS (Tabular Data Stream) Protocol. It sits between SQL clients and SQL Server, handling TLS termination and authentication with support for pluggable authenticators.
 
+> **This is a fork of [tech-software/TDSProxy](https://github.com/tech-software/TDSProxy)**, the
+> original work of Tech Software, and is distributed under its MIT licence — see
+> [LICENSE](LICENSE), which retains the original copyright.
+>
+> This fork makes it cross-platform and container-friendly: retargeted to .NET 6,
+> a Docker image with an OpenSSL configuration that still permits TLS 1.0 to
+> legacy backends, JSON/`appsettings.json` configuration in place of the .NET
+> Framework `app.config` model, and fixes to the SSL handshake adapter. The
+> upstream history is not present in this repository, so treat it as a hard fork
+> rather than a branch that can be merged back.
+
 ## Features
 
 - TDS protocol proxy for SQL Server connections
@@ -202,4 +213,25 @@ Authenticators implement `IAuthenticator` and are loaded via MEF. Place authenti
 
 ## License
 
-See LICENSE file for details.
+MIT — see [LICENSE](LICENSE), which retains the copyright of
+[Tech Software](https://github.com/tech-software/TDSProxy), whose project this is
+forked from. That notice must travel with any copy you pass on.
+
+### Third-party dependencies
+
+The proxy builds against log4net (Apache-2.0) and a set of
+`Microsoft.Extensions.*` and `System.*` packages (MIT). All are permissive and
+none is copyleft, so nothing among them constrains how this is used or modified.
+
+There is deliberately no `THIRD-PARTY-NOTICES.md` here. The attribution clauses
+in those licences attach when you *distribute* the software — handing someone a
+binary copy — and nothing in this repository does: no image is published to any
+registry, there are no releases, and the Dockerfile is built locally by whoever
+runs it. NuGet fetches every package above onto the build machine directly.
+
+That changes the moment an image is pushed anywhere. Publishing one redistributes
+those compiled assemblies, which makes their notices mandatory rather than
+courteous — Apache-2.0 §4(d) additionally requires carrying forward log4net's own
+NOTICE file. If that day comes, generate the notice from the restored package
+graph rather than writing it by hand, and copy it into the image alongside
+`LICENSE`.
