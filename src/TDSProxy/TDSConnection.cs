@@ -482,6 +482,7 @@ namespace TDSProxy
 			// forward from inside to outside, because it seems ODBC and OLEDB clients assume their SSL layer will deliver them
 			// complete packets. Gross!
 			outsideClient.NoDelay = false;
+			EnableKeepAlive(outsideClient.Client);
 
 			_outsideEP = (IPEndPoint)outsideClient.Client.RemoteEndPoint;
 			_outsideClient = outsideClient;
@@ -492,11 +493,28 @@ namespace TDSProxy
 			_insideEP = insideEndPoint;
 			_insideClient = new TcpClient(_insideEP.AddressFamily) {NoDelay = false};
 			_insideClient.Connect(insideEndPoint);
+			EnableKeepAlive(_insideClient.Client);
 			_insideStream = _insideClient.GetStream();
 			_insideActiveStream = _insideStream; // Start with plain stream, may upgrade to SSL later
 			_serverTlsConfig = listener.ServerTlsConfig;
 
 			_processingTask = ProcessConnection();
+		}
+
+		/// <summary>
+		/// Turn on TCP keep-alive so a peer that disappears without FIN or RST is noticed.
+		/// A link that is cut rather than closed leaves a blocking read waiting forever:
+		/// nothing arrives, no error is raised, and the connection pair is stranded until the
+		/// process is restarted. With keep-alive the socket faults after roughly 90 seconds
+		/// (60s idle, then 3 probes 10s apart), the catch in ProcessConnection runs, and
+		/// Close() tears down BOTH legs — so the client is told as well.
+		/// </summary>
+		static void EnableKeepAlive(Socket socket)
+		{
+			socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+			socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 60);
+			socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10);
+			socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
 		}
 
 		~TDSConnection()
