@@ -492,13 +492,74 @@ namespace TDSProxy
 
 			_insideEP = insideEndPoint;
 			_insideClient = new TcpClient(_insideEP.AddressFamily) {NoDelay = false};
-			_insideClient.Connect(insideEndPoint);
+
+			try
+			{
+				ConnectWithTimeout(_insideClient, insideEndPoint);
+			}
+			catch
+			{
+				// The far leg never came up. Undo what this constructor has already done: the
+				// Stopping subscription above is what keeps the instance alive, so without this
+				// the failed attempt lingers - still holding the client's socket - until the
+				// service stops. An hour of an unreachable server strands an hour of attempts.
+				AbandonBeforeConnected();
+				throw;
+			}
+
 			EnableKeepAlive(_insideClient.Client);
 			_insideStream = _insideClient.GetStream();
 			_insideActiveStream = _insideStream; // Start with plain stream, may upgrade to SSL later
 			_serverTlsConfig = listener.ServerTlsConfig;
 
 			_processingTask = ProcessConnection();
+		}
+
+		/// <summary>
+		/// How long to wait for the far server to answer a connection attempt. Left to the OS this
+		/// is a fixed sequence of SYN retries - over two minutes on Linux - which a blackholed route
+		/// runs through in full: longer than any client waits, and a parked thread throughout.
+		/// </summary>
+		static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(10);
+
+		static void ConnectWithTimeout(TcpClient client, IPEndPoint endPoint)
+		{
+			using (var cts = new CancellationTokenSource(ConnectTimeout))
+			{
+				try
+				{
+					client.ConnectAsync(endPoint.Address, endPoint.Port, cts.Token)
+					      .AsTask()
+					      .GetAwaiter()
+					      .GetResult();
+				}
+				catch (OperationCanceledException) when (cts.IsCancellationRequested)
+				{
+					throw new TimeoutException(
+						$"Timed out after {ConnectTimeout.TotalSeconds:0} seconds connecting to {endPoint}.");
+				}
+			}
+		}
+
+		/// <summary>
+		/// Roll back the part of construction that ran before the far leg was up, so an attempt that
+		/// never became a connection does not count as active and does not keep itself alive. The
+		/// outside client belongs to the caller, which closes it.
+		/// </summary>
+		void AbandonBeforeConnected()
+		{
+			_state = StateEnum.Closed;
+			Interlocked.Decrement(ref ActiveConnectionCount);
+			_service.Stopping -= service_Stopping;
+
+			try
+			{
+				_insideClient.Close();
+			}
+			catch (Exception e)
+			{
+				log.Error($"Error closing the inside client for connection from {_outsideEP}", e);
+			}
 		}
 
 		/// <summary>
@@ -560,7 +621,7 @@ namespace TDSProxy
 
 				try
 				{
-					_insideStream.Close();
+					_insideStream?.Close();
 				}
 				catch (Exception e)
 				{

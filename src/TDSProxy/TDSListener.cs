@@ -203,9 +203,11 @@ namespace TDSProxy
 
 		private void AcceptConnection(IAsyncResult result)
 		{
+			TcpClient readClient;
+
 			try
 			{
-				TcpClient readClient = ((TcpListener)result.AsyncState).EndAcceptTcpClient(result);
+				readClient = ((TcpListener)result.AsyncState).EndAcceptTcpClient(result);
 
 				log.InfoFormat("Accepted connection from {0} on {1}, will forward to {2}", readClient.Client.RemoteEndPoint, readClient.Client.LocalEndPoint, ForwardTo);
 
@@ -215,23 +217,54 @@ namespace TDSProxy
 					readClient.Close();
 					return;
 				}
+			}
+			catch (ObjectDisposedException)
+			{
+				/* We're shutting down, ignore */
+				return;
+			}
+			catch (Exception e)
+			{
+				log.Fatal("Error accepting connection.", e);
+				return;
+			}
+			finally
+			{
+				ResumeAccepting();
+			}
 
+			// Setting up the connection dials the far server, and that dial blocks. It has to happen
+			// after the listener is accepting again: a server that swallows SYNs takes the connect
+			// timeout to fail, and until this method returned, that was equally how long every other
+			// client sat in the backlog waiting to be accepted.
+			try
+			{
 				new TDSConnection(_service, this, readClient, ForwardTo);
 			}
-			catch (ObjectDisposedException) { /* We're shutting down, ignore */ }
 			catch (Exception e)
 			{
 				log.Fatal("Error in AcceptConnection.", e);
-			}
-
-			if (!_stopped)
-			{
 				try
 				{
-					_tcpListener?.BeginAcceptTcpClient(AcceptConnection, _tcpListener);
+					readClient.Close();
 				}
-				catch (ObjectDisposedException) { /* We're shutting down, ignore */ }
+				catch (Exception closeError)
+				{
+					log.Error("Error closing a connection that could not be set up.", closeError);
+				}
 			}
+		}
+
+		void ResumeAccepting()
+		{
+			if (_stopped)
+				return;
+
+			try
+			{
+				_tcpListener?.BeginAcceptTcpClient(AcceptConnection, _tcpListener);
+			}
+			catch (ObjectDisposedException) { /* We're shutting down, ignore */ }
 		}
 
 		public void Dispose()
